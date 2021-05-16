@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Jetstack cert-manager contributors.
+Copyright 2020 The cert-manager Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,18 +22,22 @@ import (
 	vault "github.com/hashicorp/vault/api"
 	corelisters "k8s.io/client-go/listers/core/v1"
 
-	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
+	v1 "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
 )
 
 type Vault struct {
-	NewFn  func(string, corelisters.SecretLister, v1.GenericIssuer) (*Vault, error)
-	SignFn func([]byte, time.Duration) ([]byte, []byte, error)
+	NewFn                           func(string, corelisters.SecretLister, v1.GenericIssuer) (*Vault, error)
+	SignFn                          func([]byte, time.Duration) ([]byte, []byte, error)
+	IsVaultInitializedAndUnsealedFn func() error
 }
 
 func New() *Vault {
 	v := &Vault{
 		SignFn: func([]byte, time.Duration) ([]byte, []byte, error) {
 			return nil, nil, nil
+		},
+		IsVaultInitializedAndUnsealedFn: func() error {
+			return nil
 		},
 	}
 
@@ -71,4 +75,8 @@ func (v *Vault) New(ns string, sl corelisters.SecretLister, iss v1.GenericIssuer
 
 func (v *Vault) Sys() *vault.Sys {
 	return new(vault.Sys)
+}
+
+func (v *Vault) IsVaultInitializedAndUnsealed() error {
+	return nil
 }

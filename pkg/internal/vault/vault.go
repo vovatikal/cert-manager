@@ -1,5 +1,5 @@
 /*
-Copyright 2019 The Jetstack cert-manager contributors.
+Copyright 2020 The cert-manager Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ import (
 	"github.com/hashicorp/vault/sdk/helper/certutil"
 	corelisters "k8s.io/client-go/listers/core/v1"
 
-	"github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
+	v1 "github.com/jetstack/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/jetstack/cert-manager/pkg/util/pki"
 )
 
@@ -42,6 +42,7 @@ type VaultClientBuilder func(namespace string, secretsLister corelisters.SecretL
 type Interface interface {
 	Sign(csrPEM []byte, duration time.Duration) (certPEM []byte, caPEM []byte, err error)
 	Sys() *vault.Sys
+	IsVaultInitializedAndUnsealed() error
 }
 
 type Client interface {
@@ -109,11 +110,7 @@ func (v *Vault) Sign(csrPEM []byte, duration time.Duration) (cert []byte, ca []b
 
 	request := v.client.NewRequest("POST", url)
 
-	if vaultIssuer.Namespace != "" {
-		vaultReqHeaders := http.Header{}
-		vaultReqHeaders.Add("X-VAULT-NAMESPACE", vaultIssuer.Namespace)
-		request.Headers = vaultReqHeaders
-	}
+	v.addVaultNamespaceToRequest(request)
 
 	if err := request.SetJSONBody(parameters); err != nil {
 		return nil, nil, fmt.Errorf("failed to build vault request: %s", err)
@@ -132,22 +129,7 @@ func (v *Vault) Sign(csrPEM []byte, duration time.Duration) (cert []byte, ca []b
 		return nil, nil, fmt.Errorf("failed to decode response returned by vault: %s", err)
 	}
 
-	parsedBundle, err := certutil.ParsePKIMap(vaultResult.Data)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to decode response returned by vault: %s", err)
-	}
-
-	bundle, err := parsedBundle.ToCertBundle()
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to convert certificate bundle to PEM bundle: %s", err.Error())
-	}
-
-	var caPem []byte = nil
-	if len(bundle.CAChain) > 0 {
-		caPem = []byte(bundle.CAChain[0])
-	}
-
-	return []byte(bundle.ToPEMBundle()), caPem, nil
+	return extractCertificatesFromVaultCertificateSecret(&vaultResult)
 }
 
 func (v *Vault) setToken(client Client) error {
@@ -273,6 +255,8 @@ func (v *Vault) requestTokenWithAppRoleRef(client Client, appRole *v1.VaultAppRo
 		return "", fmt.Errorf("error encoding Vault parameters: %s", err.Error())
 	}
 
+	v.addVaultNamespaceToRequest(request)
+
 	resp, err := client.RawRequest(request)
 	if err != nil {
 		return "", fmt.Errorf("error logging in to Vault server: %s", err.Error())
@@ -332,6 +316,8 @@ func (v *Vault) requestTokenWithKubernetesAuth(client Client, kubernetesAuth *v1
 		return "", fmt.Errorf("error encoding Vault parameters: %s", err.Error())
 	}
 
+	v.addVaultNamespaceToRequest(request)
+
 	resp, err := client.RawRequest(request)
 	if err != nil {
 		return "", fmt.Errorf("error calling Vault server: %s", err.Error())
@@ -354,4 +340,57 @@ func (v *Vault) requestTokenWithKubernetesAuth(client Client, kubernetesAuth *v1
 
 func (v *Vault) Sys() *vault.Sys {
 	return v.client.Sys()
+}
+
+func extractCertificatesFromVaultCertificateSecret(secret *certutil.Secret) ([]byte, []byte, error) {
+	parsedBundle, err := certutil.ParsePKIMap(secret.Data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to decode response returned by vault: %s", err)
+	}
+
+	bundle, err := parsedBundle.ToCertBundle()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to convert certificate bundle to PEM bundle: %s", err.Error())
+	}
+
+	var caPem []byte
+	if len(bundle.CAChain) > 0 {
+		caPem = []byte(bundle.CAChain[len(bundle.CAChain)-1])
+	} else {
+		caPem = []byte(bundle.IssuingCA)
+	}
+
+	crtPems := []string{bundle.Certificate}
+	if len(bundle.CAChain) > 1 {
+		crtPems = append(crtPems, bundle.CAChain[0:len(bundle.CAChain)-1]...)
+	}
+
+	return []byte(strings.Join(crtPems, "\n")), caPem, nil
+}
+
+func (v *Vault) IsVaultInitializedAndUnsealed() error {
+	healthURL := path.Join("/v1", "sys", "health")
+	healthRequest := v.client.NewRequest("GET", healthURL)
+	healthResp, err := v.client.RawRequest(healthRequest)
+	// 429 = if unsealed and standby
+	// 472 = if disaster recovery mode replication secondary and active
+	// 473 = if performance standby
+	if err != nil && healthResp.StatusCode != 429 && healthResp.StatusCode != 472 && healthResp.StatusCode != 473 {
+		return err
+	}
+	defer healthResp.Body.Close()
+	return nil
+}
+
+func (v *Vault) addVaultNamespaceToRequest(request *vault.Request) {
+	vaultIssuer := v.issuer.GetSpec().Vault
+	if vaultIssuer != nil && vaultIssuer.Namespace != "" {
+		if request.Headers != nil {
+			request.Headers.Add("X-VAULT-NAMESPACE", vaultIssuer.Namespace)
+		} else {
+			vaultReqHeaders := http.Header{}
+			vaultReqHeaders.Add("X-VAULT-NAMESPACE", vaultIssuer.Namespace)
+			request.Headers = vaultReqHeaders
+		}
+	}
 }
